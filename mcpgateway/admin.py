@@ -5688,74 +5688,80 @@ async def admin_add_gateway(request: Request, db: Session = Depends(get_db), use
 # OAuth callback is now handled by the dedicated OAuth router at /oauth/callback
 # This route has been removed to avoid conflicts with the complete implementation
 
-@admin_router.post("/admin/gateways/sync")
-async def sync_all_gateways(include_inactive: bool = False, team_id: str | None = None):
+@admin_router.post("/gateways/sync")
+async def admin_sync_gateways(
+    request: Request,
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_with_permissions),
+) -> JSONResponse:
+    """Synchronize tools, resources, and prompts for registered gateways.
+
+    The endpoint accepts an optional JSON body with a list of gateway IDs to
+    target. When no IDs are supplied, every active gateway is synchronized by
+    default.  The ``include_inactive`` flag can be provided either via query
+    string or in the JSON payload to include disabled gateways in the
+    synchronization pass.
     """
-    Discover & upsert tools/resources/prompts for every registered gateway.
-    - Optional: include_inactive=true to also sync disabled gateways
-    - Optional: team_id=<id> to scope the listing if your repo supports teams
-    """
-    # ✅ Adjust these imports to your project layout
-    from mcpgateway.db import list_gateways, upsert_discovery_results  # repo helpers
-    from mcpgateway.services.discovery import discover_server          # discovery helper
 
-    # 1) Fetch gateways
-    gateways = await list_gateways(include_inactive=include_inactive, team_id=team_id)
-    if not gateways:
-        return {
-            "status": "ok",
-            "message": "No gateways found to sync.",
-            "total_gateways": 0,
-            "results": [],
-            "totals": {"tools": 0, "resources": 0, "prompts": 0, "errors": 0},
-        }
+    payload: Dict[str, Any] = {}
+    try:
+        if request.headers.get("content-length") and int(request.headers["content-length"]) > 0:
+            payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        payload = {}
 
-    results: List[Dict[str, Any]] = []
-    totals = {"tools": 0, "resources": 0, "prompts": 0, "errors": 0}
+    body_include_inactive = payload.get("include_inactive")
+    if isinstance(body_include_inactive, bool):
+        include_inactive = body_include_inactive
 
-    # 2) Run sequentially (predictable load). Switch to asyncio.gather if you want parallel.
-    for gw in gateways:
-        gw_id = getattr(gw, "id", None) or getattr(gw, "gateway_id", None) or getattr(gw, "uuid", None)
-        gw_name = getattr(gw, "name", None) or getattr(gw, "url", None) or (gw_id or "gateway")
+    gateway_ids: Optional[List[str]]
+    raw_gateway_ids = payload.get("gateway_ids") or payload.get("gateway_id")
+    if raw_gateway_ids is None:
+        gateway_ids = None
+    elif isinstance(raw_gateway_ids, (list, tuple, set)):
+        gateway_ids = [str(item).strip() for item in raw_gateway_ids if str(item).strip()]
+    else:
+        gateway_ids = [str(raw_gateway_ids).strip()]
 
-        try:
-            # 2a) Discover from the remote MCP server
-            discovery_data: Dict[str, Any] = await discover_server(gw)  # should return dict with keys: tools, resources, prompts
+    summary = await gateway_service.sync_gateway_content(
+        db,
+        gateway_ids=gateway_ids if gateway_ids else None,
+        include_inactive=include_inactive,
+    )
 
-            # 2b) Upsert into your DB
-            upserted = await upsert_discovery_results(gateway_id=gw_id, data=discovery_data)
-            # upsert_discovery_results should return counts, e.g. {"tools": n, "resources": n, "prompts": n}
+    processed: List[Dict[str, Any]] = summary.get("processed", [])
+    errors: Dict[str, str] = summary.get("errors", {})
 
-            t = int(upserted.get("tools", 0))
-            r = int(upserted.get("resources", 0))
-            p = int(upserted.get("prompts", 0))
+    total_tools = sum(int(item.get("tools", 0)) for item in processed)
+    total_resources = sum(int(item.get("resources", 0)) for item in processed)
+    total_prompts = sum(int(item.get("prompts", 0)) for item in processed)
 
-            totals["tools"] += t
-            totals["resources"] += r
-            totals["prompts"] += p
-
-            results.append({
-                "gateway_id": gw_id,
-                "name": gw_name,
-                "status": "success",
-                "updated_counts": {"tools": t, "resources": r, "prompts": p},
-            })
-        except Exception as e:
-            totals["errors"] += 1
-            results.append({
-                "gateway_id": gw_id,
-                "name": gw_name,
-                "status": "error",
-                "error": str(e),
-            })
-
-    return {
-        "status": "ok",
-        "message": f"Synced {len(gateways)} gateway(s).",
-        "total_gateways": len(gateways),
-        "results": results,
-        "totals": totals,
+    response_payload: Dict[str, Any] = {
+        "success": True,
+        "message": "Gateway synchronization complete.",
+        "processed": processed,
+        "errors": errors,
+        "updated_counts": {
+            "gateways": len(processed),
+            "tools": total_tools,
+            "resources": total_resources,
+            "prompts": total_prompts,
+        },
     }
+
+    if errors:
+        response_payload["success"] = False
+        response_payload["message"] = "Gateway synchronization completed with errors."
+
+    LOGGER.info(
+        "User %s triggered gateway sync for %s gateway(s) (include_inactive=%s)",
+        get_user_email(user),
+        "all" if gateway_ids is None else len(gateway_ids),
+        include_inactive,
+    )
+
+    return JSONResponse(content=response_payload)
 
 @admin_router.post("/gateways/{gateway_id}/edit")
 async def admin_edit_gateway(

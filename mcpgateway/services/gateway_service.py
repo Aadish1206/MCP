@@ -804,6 +804,200 @@ class GatewayService:  # pylint: disable=too-many-instance-attributes
             logger.error(f"Failed to fetch tools after OAuth for gateway {gateway_id}: {e}")
             raise GatewayConnectionError(f"Failed to fetch tools after OAuth: {str(e)}")
 
+    async def sync_gateway_content(
+        self,
+        db: Session,
+        gateway_ids: Optional[List[str]] = None,
+        include_inactive: bool = False,
+    ) -> Dict[str, Any]:
+        """Synchronize tools, resources, and prompts for registered gateways.
+
+        Args:
+            db: Database session used for persistence operations.
+            gateway_ids: Optional list of gateway IDs to scope the synchronization.
+            include_inactive: Whether to include inactive gateways in the sync.
+
+        Returns:
+            Summary dictionary containing processed gateways and any errors encountered.
+        """
+
+        query = select(DbGateway)
+        if gateway_ids:
+            query = query.where(DbGateway.id.in_(gateway_ids))
+        if not include_inactive:
+            query = query.where(DbGateway.enabled)
+
+        gateways = db.execute(query).scalars().all()
+
+        processed: List[Dict[str, Any]] = []
+        errors: Dict[str, str] = {}
+
+        for gateway in gateways:
+            if gateway.auth_type == "oauth" and gateway.oauth_config:
+                grant_type = gateway.oauth_config.get("grant_type")
+                if grant_type == "authorization_code":
+                    message = (
+                        "Gateway uses OAuth authorization code flow; user authorization required before syncing."
+                    )
+                    logger.info("Skipping sync for gateway %s: %s", gateway.name, message)
+                    errors[str(gateway.id)] = message
+                    continue
+
+            try:
+                authentication: Optional[Any] = None
+                if gateway.auth_type and gateway.auth_type.lower() != "oauth" and gateway.auth_value:
+                    authentication = gateway.auth_value
+
+                capabilities, tools, resources, prompts = await self._initialize_gateway(
+                    gateway.url,
+                    authentication,
+                    gateway.transport or "SSE",
+                    gateway.auth_type,
+                    gateway.oauth_config,
+                )
+
+                new_tool_names = {tool.name for tool in tools}
+                new_resource_uris = {resource.uri for resource in resources}
+                new_prompt_names = {prompt.name for prompt in prompts}
+
+                for tool in tools:
+                    existing_tool = (
+                        db.execute(
+                            select(DbTool)
+                            .where(DbTool.original_name == tool.name)
+                            .where(DbTool.gateway_id == gateway.id)
+                        ).scalar_one_or_none()
+                    )
+
+                    if existing_tool:
+                        existing_tool.url = gateway.url
+                        existing_tool.description = tool.description
+                        existing_tool.integration_type = "MCP"
+                        existing_tool.request_type = tool.request_type
+                        existing_tool.headers = tool.headers
+                        existing_tool.input_schema = tool.input_schema
+                        existing_tool.annotations = tool.annotations
+                        existing_tool.jsonpath_filter = tool.jsonpath_filter
+                        existing_tool.auth_type = gateway.auth_type
+                        existing_tool.auth_value = gateway.auth_value
+                        existing_tool.visibility = gateway.visibility or existing_tool.visibility
+                    else:
+                        db_tool = self._create_db_tool(
+                            tool=tool,
+                            gateway=gateway,
+                            created_by="system",
+                            created_via="sync",
+                        )
+                        db_tool.gateway = gateway
+                        db.add(db_tool)
+
+                for resource in resources:
+                    existing_resource = (
+                        db.execute(
+                            select(DbResource)
+                            .where(DbResource.uri == resource.uri)
+                            .where(DbResource.gateway_id == gateway.id)
+                        ).scalar_one_or_none()
+                    )
+
+                    if existing_resource:
+                        existing_resource.name = resource.name
+                        existing_resource.description = resource.description
+                        existing_resource.mime_type = resource.mime_type
+                        existing_resource.template = resource.template
+                        existing_resource.visibility = gateway.visibility or existing_resource.visibility
+                        existing_resource.federation_source = gateway.name
+                    else:
+                        db_resource = DbResource(
+                            uri=resource.uri,
+                            name=resource.name,
+                            description=resource.description,
+                            mime_type=resource.mime_type,
+                            template=resource.template,
+                            created_by="system",
+                            created_via="sync",
+                            federation_source=gateway.name,
+                            version=1,
+                            team_id=gateway.team_id,
+                            owner_email=gateway.owner_email,
+                            visibility=gateway.visibility or "public",
+                        )
+                        db_resource.gateway = gateway
+                        db.add(db_resource)
+
+                for prompt in prompts:
+                    existing_prompt = (
+                        db.execute(
+                            select(DbPrompt)
+                            .where(DbPrompt.name == prompt.name)
+                            .where(DbPrompt.gateway_id == gateway.id)
+                        ).scalar_one_or_none()
+                    )
+
+                    if existing_prompt:
+                        existing_prompt.description = prompt.description
+                        existing_prompt.template = (
+                            prompt.template if hasattr(prompt, "template") else existing_prompt.template
+                        )
+                        existing_prompt.visibility = gateway.visibility or existing_prompt.visibility
+                        if hasattr(prompt, "argument_schema") and prompt.argument_schema is not None:
+                            existing_prompt.argument_schema = prompt.argument_schema
+                        existing_prompt.federation_source = gateway.name
+                    else:
+                        db_prompt = DbPrompt(
+                            name=prompt.name,
+                            description=prompt.description,
+                            template=prompt.template if hasattr(prompt, "template") else "",
+                            argument_schema=getattr(prompt, "argument_schema", {}),
+                            created_by="system",
+                            created_via="sync",
+                            federation_source=gateway.name,
+                            version=1,
+                            team_id=gateway.team_id,
+                            owner_email=gateway.owner_email,
+                            visibility=gateway.visibility or "public",
+                        )
+                        db_prompt.gateway = gateway
+                        db.add(db_prompt)
+
+                if gateway.tools:
+                    gateway.tools = [tool for tool in gateway.tools if tool.original_name in new_tool_names]
+                if gateway.resources:
+                    gateway.resources = [resource for resource in gateway.resources if resource.uri in new_resource_uris]
+                if gateway.prompts:
+                    gateway.prompts = [prompt for prompt in gateway.prompts if prompt.name in new_prompt_names]
+
+                gateway.capabilities = capabilities
+                gateway.last_seen = datetime.now(timezone.utc)
+                gateway.reachable = True
+                gateway.updated_at = datetime.now(timezone.utc)
+                if hasattr(gateway, "version") and gateway.version is not None:
+                    gateway.version = gateway.version + 1
+                else:
+                    gateway.version = 1
+
+                self._active_gateways.add(gateway.url)
+
+                db.commit()
+                db.refresh(gateway)
+
+                processed.append(
+                    {
+                        "id": str(gateway.id),
+                        "name": gateway.name,
+                        "tools": len(new_tool_names),
+                        "resources": len(new_resource_uris),
+                        "prompts": len(new_prompt_names),
+                    }
+                )
+            except Exception as exc:  # pragma: no cover - error path
+                db.rollback()
+                error_message = f"Failed to sync gateway {gateway.name}: {exc}"
+                logger.error(error_message)
+                errors[str(gateway.id)] = str(exc)
+
+        return {"processed": processed, "errors": errors}
+
     async def list_gateways(self, db: Session, include_inactive: bool = False, tags: Optional[List[str]] = None) -> List[GatewayRead]:
         """List all registered gateways.
 
