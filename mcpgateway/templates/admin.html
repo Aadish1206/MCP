@@ -7314,16 +7314,14 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
           ? window.reloadAllResourceSections.bind(window)
           : null;
 
-      window.reloadAllResourceSections = function reloadAllResourceSections(
-        teamId,
-      ) {
+      function reloadAllResourceSections(teamId) {
         // delegate to the implementation in admin.js
         if (typeof __reloadAllResourceSectionsImpl === 'function') {
           return __reloadAllResourceSectionsImpl(teamId);
         }
 
         console.warn('reloadAllResourceSections implementation not available.');
-      };
+      }
 
       function updateSectionHeaders(teamId) {
         const sections = ['tools', 'resources', 'prompts', 'servers', 'gateways'];
