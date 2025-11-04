@@ -7815,12 +7815,30 @@ async function handleEditResFormSubmit(e) {
 
 // ...existing code...
 
-// -------------------- NEW: Sync all gateways helper --------------------
-/**
- * Discover all registered gateways from the backend and run syncGateway for each.
- * Exposed as window.syncAllGateways so inline onclick="syncAllGateways()" works.
- */
-async function syncAllGateways() {
+// -------------------- Gateway synchronization helpers --------------------
+
+async function performGatewaySyncRequest(body = {}) {
+    const base = window.ROOT_PATH || "";
+    const url = `${base}/admin/gateways/sync`;
+
+    const response = await fetchWithTimeout(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+        },
+        credentials: "same-origin",
+        body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response.json().catch(() => ({}));
+}
+
+async function syncAllGateways(options = {}) {
     const btn = document.getElementById("sync-gateways-btn");
     const spinner = document.getElementById("sync-gateways-loading");
 
@@ -7829,129 +7847,104 @@ async function syncAllGateways() {
         btn.classList.add("opacity-60", "cursor-not-allowed");
         btn.textContent = "⏳ Syncing...";
     }
-    if (spinner) spinner.style.display = "block";
+    if (spinner) {
+        spinner.style.display = "block";
+    }
 
     try {
-        // Try common gateways JSON endpoint(s)
-        const candidate = [
-            `${window.ROOT_PATH}/admin/gateways?format=json`,
-            `${window.ROOT_PATH}/admin/gateways.json`,
-            `${window.ROOT_PATH}/admin/gateways`,
-        ];
-
-        let payload = null;
-        for (const url of candidate) {
-            try {
-                const resp = await fetchWithTimeout(url, { credentials: "same-origin" });
-                if (!resp.ok) continue;
-                payload = await resp.json().catch(() => null);
-                if (payload) break;
-            } catch (err) {
-                // try next
-                continue;
-            }
+        const payload = {};
+        if (options.includeInactive) {
+            payload.include_inactive = true;
+        }
+        if (options.teamId) {
+            payload.team_id = options.teamId;
         }
 
-        const gateways =
-            Array.isArray(payload)
-                ? payload
-                : Array.isArray(payload?.gateways)
-                ? payload.gateways
-                : Array.isArray(payload?.items)
-                ? payload.items
-                : [];
+        const result = await performGatewaySyncRequest(payload);
 
-        if (!gateways || gateways.length === 0) {
-            showErrorMessage("No gateways found to sync.");
-            return;
+        const totals = result?.updated_counts || {};
+        const totalGateways =
+            typeof totals.gateways === "number"
+                ? totals.gateways
+                : Array.isArray(result?.processed)
+                ? result.processed.length
+                : 0;
+
+        showSuccessMessage(
+            `✅ Synced ${totalGateways} gateway(s). Tools: ${totals.tools ?? 0}, Resources: ${totals.resources ?? 0}, Prompts: ${totals.prompts ?? 0}`,
+        );
+
+        if (result?.errors && Object.keys(result.errors).length) {
+            console.warn("Gateway sync completed with errors", result.errors);
+            showErrorMessage("Some gateways could not be synchronized. Check logs for details.");
         }
 
-        showSuccessMessage(`Syncing ${gateways.length} gateway(s)...`);
-
-        // Run sequentially to avoid overloading backend
-        for (const gw of gateways) {
-            try {
-                const id = gw.id || gw.gatewayId || gw.uuid || gw._id;
-                const name = gw.name || gw.url || id || "Gateway";
-                if (!id) {
-                    console.warn("Skipping gateway without id", gw);
-                    continue;
-                }
-                // syncGateway is defined elsewhere and exposed globally
-                await syncGateway(id, name);
-            } catch (err) {
-                console.error("syncAllGateways: gateway sync failed", err);
-            }
+        if (typeof reloadAllResourceSections === "function") {
+            reloadAllResourceSections();
+        } else {
+            window.location.reload();
         }
 
-        showSuccessMessage("Gateway sync complete.");
-        setTimeout(() => {
-            if (typeof reloadAllResourceSections === "function") {
-                reloadAllResourceSections();
-            } else {
-                window.location.reload();
-            }
-        }, 1200);
+        return result;
     } catch (error) {
         console.error("syncAllGateways error:", error);
         showErrorMessage(`Sync failed: ${error.message || error}`);
+        throw error;
     } finally {
         if (btn) {
             btn.disabled = false;
             btn.classList.remove("opacity-60", "cursor-not-allowed");
             btn.textContent = "Sync";
         }
-        if (spinner) spinner.style.display = "none";
+        if (spinner) {
+            spinner.style.display = "none";
+        }
     }
 }
 
-// Wire up the main Sync button if present (defensive, avoids double-binding)
 document.addEventListener("DOMContentLoaded", () => {
     try {
         const btn = document.getElementById("sync-gateways-btn");
         if (btn && !btn.dataset.wiredSync) {
-            btn.addEventListener("click", (e) => {
-                e.preventDefault();
+            btn.addEventListener("click", (event) => {
+                event.preventDefault();
                 syncAllGateways();
             });
             btn.dataset.wiredSync = "1";
         }
-    } catch (err) {
-        console.warn("Failed to auto-wire global sync button:", err);
+    } catch (error) {
+        console.warn("Failed to wire global sync button:", error);
     }
 });
 
-
 async function syncGateway(gatewayId, gatewayName = "Gateway") {
-  const base = window.ROOT_PATH || "";
-  const urls = [
-    `${base}/gateways/${encodeURIComponent(gatewayId)}/sync`,
-    `${base}/gateways/${encodeURIComponent(gatewayId)}/sync`,
-  ];
-
-  let lastErr = null;
-  for (const url of urls) {
-    try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "same-origin",
-      });
-      if (!resp.ok) {
-        lastErr = new Error(`HTTP ${resp.status}`);
-        continue;
-      }
-      const payload = await resp.json().catch(() => ({}));
-      const c = payload?.updated_counts || payload?.discovered || {};
-      showSuccessMessage(
-        `✅ Synced ${gatewayName}: tools ${c.tools ?? "?"}, resources ${c.resources ?? "?"}, prompts ${c.prompts ?? "?"}`
-      );
-      return payload;
-    } catch (e) {
-      lastErr = e;
+    if (!gatewayId) {
+        throw new Error("Gateway ID is required for synchronization");
     }
-  }
-  throw lastErr || new Error("Sync failed");
+
+    const result = await performGatewaySyncRequest({ gateway_ids: [gatewayId] });
+
+    const processed = Array.isArray(result?.processed) ? result.processed : [];
+    const gatewayKey = String(gatewayId);
+    const matched =
+        processed.find(
+            (entry) => String(entry.id ?? entry.gateway_id ?? "") === gatewayKey,
+        ) || processed[0];
+
+    const counts = matched || result?.updated_counts || {};
+    const tools = typeof counts.tools === "number" ? counts.tools : 0;
+    const resources = typeof counts.resources === "number" ? counts.resources : 0;
+    const prompts = typeof counts.prompts === "number" ? counts.prompts : 0;
+
+    showSuccessMessage(
+        `✅ Synced ${gatewayName}: tools ${tools}, resources ${resources}, prompts ${prompts}`,
+    );
+
+    if (result?.errors && result.errors[gatewayKey]) {
+        showErrorMessage(result.errors[gatewayKey]);
+    }
+
+    return result;
 }
 
 
