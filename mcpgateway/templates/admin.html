@@ -7309,13 +7309,18 @@ Hello &#123;&#123; name &#125;&#125;, welcome to &#123;&#123; company &#125;&#12
         }
       }
 
+      const __reloadAllResourceSectionsImpl =
+        typeof window.reloadAllResourceSections === 'function'
+          ? window.reloadAllResourceSections.bind(window)
+          : null;
+
       function reloadAllResourceSections(teamId) {
         // delegate to the implementation in admin.js
-        if (window.reloadAllResourceSections) {
-          return window.reloadAllResourceSections(teamId);
-        } else {
-          console.warn('reloadAllResourceSections implementation not available.');
+        if (typeof __reloadAllResourceSectionsImpl === 'function') {
+          return __reloadAllResourceSectionsImpl(teamId);
         }
+
+        console.warn('reloadAllResourceSections implementation not available.');
       }
 
       function updateSectionHeaders(teamId) {
